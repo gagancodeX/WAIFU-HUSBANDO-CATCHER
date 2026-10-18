@@ -55,7 +55,7 @@ async def daily(update: Update, context: CallbackContext) -> None:
     u   = update.effective_user
     doc = await _ensure_user(u.id, u)
     now = time.time()
-    last = doc.get("last_daily", 0)
+    last = float(doc.get("last_daily", 0) or 0)
 
     if now - last < _DAILY_COOLDOWN:
         remaining = int(_DAILY_COOLDOWN - (now - last))
@@ -65,15 +65,33 @@ async def daily(update: Update, context: CallbackContext) -> None:
         )
         return
 
+    # Conditional update makes the cooldown check and claim one atomic DB
+    # operation; concurrent /daily calls cannot both win the same cooldown.
     reward = Config.DAILY_COINS
-    await user_collection.update_one(
-        {"id": u.id},
+    result = await user_collection.update_one(
+        {"id": u.id, "last_daily": {"$lt": now - _DAILY_COOLDOWN}},
         {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
     )
+    if result.modified_count != 1:
+        # Missing last_daily is handled separately for legacy/new documents.
+        result = await user_collection.update_one(
+            {"id": u.id, "last_daily": {"$exists": False}},
+            {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
+        )
+    if result.modified_count != 1:
+        latest = await user_collection.find_one({"id": u.id}) or {}
+        remaining = max(1, int(_DAILY_COOLDOWN - (now - float(latest.get("last_daily", now)))))
+        await update.message.reply_text(
+            f"⏳ Daily already claimed!\nCome back in <b>{_fmt_time(remaining)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    latest = await user_collection.find_one({"id": u.id}) or {}
     await update.message.reply_text(
         f"🎁 <b>Daily reward!</b>\n\n"
         f"You received <b>{reward:,} coins</b> 🪙\n"
-        f"Current balance: <b>{doc.get('coins', 0) + reward:,}</b>",
+        f"Current balance: <b>{latest.get('coins', 0):,}</b>",
         parse_mode=ParseMode.HTML,
     )
 

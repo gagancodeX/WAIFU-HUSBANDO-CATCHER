@@ -70,7 +70,7 @@ def _rolling_window_size(total_chars: int) -> int:
 
 async def _send_drop_unlocked(chat_id: int, bot) -> None:
     """Pick a random unseen-recently character and post it to the chat."""
-    all_chars = await collection.find({}).to_list(length=5000)
+    all_chars = await collection.find({"store_only": {"$ne": True}}).to_list(length=5000)
     if not all_chars:
         LOGGER.debug("No characters in DB — skipping drop for chat %s", chat_id)
         return

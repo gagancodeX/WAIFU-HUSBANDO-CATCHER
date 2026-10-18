@@ -183,6 +183,14 @@ async def hclaim(authorization: str | None = Header(default=None)):
     return {"ok": True, "character": public(c)}
 
 
+@app.get("/api/admin/characters")
+async def admin_characters(authorization: str | None = Header(default=None)):
+    tg, _, perms = await auth(authorization)
+    require(perms, "manage_characters")
+    docs = await chars.find({}).limit(500).to_list(500)
+    return {"characters": [public(c) for c in docs]}
+
+
 @app.patch("/api/admin/characters/{char_id}")
 async def edit_character(char_id: str, body: CharacterPatch, authorization: str | None = Header(default=None)):
     tg, _, perms = await auth(authorization)
@@ -219,7 +227,8 @@ async def set_settings(body: SettingsPatch, authorization: str | None = Header(d
 @app.put("/api/admin/admins")
 async def set_admin(body: AdminBody, authorization: str | None = Header(default=None)):
     tg, _, perms = await auth(authorization)
-    require(perms, "manage_admins")
+    if tg["id"] != OWNER_ID or not OWNER_ID:
+        raise HTTPException(403, "Only the owner can manage admin roles.")
     if body.user_id == OWNER_ID:
         raise HTTPException(400, "Owner permissions cannot be changed.")
     allowed = {"manage_characters", "manage_settings", "manage_admins", "manage_events", "manage_shop", "view_analytics"}
@@ -230,3 +239,14 @@ async def set_admin(body: AdminBody, authorization: str | None = Header(default=
         "updated_by": tg["id"], "updated_at": int(time.time()),
     }}, upsert=True)
     return {"ok": True}
+
+@app.delete("/api/admin/admins/{user_id}")
+async def delete_admin(user_id: int, authorization: str | None = Header(default=None)):
+    tg, _, _ = await auth(authorization)
+    if tg["id"] != OWNER_ID or not OWNER_ID:
+        raise HTTPException(403, "Only the owner can manage admin roles.")
+    if user_id == OWNER_ID:
+        raise HTTPException(400, "The owner cannot be removed.")
+    await admins.delete_one({"user_id": user_id})
+    return {"ok": True}
+

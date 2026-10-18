@@ -79,11 +79,19 @@ async def trade_cb(update: Update, context: CallbackContext) -> None:
     q      = update.callback_query
     action, tid = q.data.split(":", 1)
 
-    state = _trades.pop(tid, None)
+    # Check authorization before consuming the pending proposal. Otherwise,
+    # any user who presses a button could invalidate someone else's trade.
+    state = _trades.get(tid)
     if not state:
         await q.answer("⌛ Trade expired!", show_alert=True); return
     if q.from_user.id != state["b_id"]:
         await q.answer("❌ Not your trade!", show_alert=True); return
+
+    # Pop only after authorization; this also makes acceptance single-use when
+    # two callback updates arrive close together.
+    state = _trades.pop(tid, None)
+    if not state:
+        await q.answer("⌛ Trade already handled!", show_alert=True); return
 
     await q.answer()
     if action == "trade_no":
@@ -150,11 +158,17 @@ async def gift_cb(update: Update, context: CallbackContext) -> None:
     q      = update.callback_query
     action, gid = q.data.split(":", 1)
 
-    state = _gifts.pop(gid, None)
+    # Do not let an unrelated user consume/cancel a pending gift.
+    state = _gifts.get(gid)
     if not state:
         await q.answer("⌛ Gift expired!", show_alert=True); return
     if q.from_user.id != state["a_id"]:
         await q.answer("❌ Not your gift!", show_alert=True); return
+
+    # Consume the proposal only after authorization and only once.
+    state = _gifts.pop(gid, None)
+    if not state:
+        await q.answer("⌛ Gift already handled!", show_alert=True); return
 
     await q.answer()
     if action == "gift_no":

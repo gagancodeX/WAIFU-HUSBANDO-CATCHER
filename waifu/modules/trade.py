@@ -76,32 +76,58 @@ async def trade(update: Update, context: CallbackContext) -> None:
 
 
 async def trade_cb(update: Update, context: CallbackContext) -> None:
-    q      = update.callback_query
+    q = update.callback_query
     action, tid = q.data.split(":", 1)
 
-    # Check authorization before consuming the pending proposal. Otherwise,
-    # any user who presses a button could invalidate someone else's trade.
     state = _trades.get(tid)
     if not state:
         await q.answer("⌛ Trade expired!", show_alert=True); return
     if q.from_user.id != state["b_id"]:
         await q.answer("❌ Not your trade!", show_alert=True); return
 
-    # Pop only after authorization; this also makes acceptance single-use when
-    # two callback updates arrive close together.
+    # Validate both characters are still owned by the expected players.
+    a_id, b_id = state["a_id"], state["b_id"]
+    a_char, b_char = state["a_char"], state["b_char"]
+    if action == "trade_no":
+        _trades.pop(tid, None)
+        await q.answer()
+        await q.edit_message_text("❌ Trade declined.")
+        return
+
+    # The previous proposal can become stale if either character was sold,
+    # gifted, or traded while the confirmation was waiting.
+    a_doc = await user_collection.find_one({"id": a_id, "characters.id": a_char["id"]})
+    b_doc = await user_collection.find_one({"id": b_id, "characters.id": b_char["id"]})
+    if not a_doc or not b_doc:
+        _trades.pop(tid, None)
+        await q.answer("❌ One of these characters is no longer owned by its trader.", show_alert=True)
+        await q.edit_message_text("❌ Trade cancelled because a character is no longer available.")
+        return
+
+    # Use a per-trade lock by consuming the state before inventory writes.
     state = _trades.pop(tid, None)
     if not state:
         await q.answer("⌛ Trade already handled!", show_alert=True); return
-
     await q.answer()
-    if action == "trade_no":
-        await q.edit_message_text("❌ Trade declined."); return
 
-    a_id, b_id = state["a_id"], state["b_id"]
-    a_char, b_char = state["a_char"], state["b_char"]
+    # Conditional pulls ensure the same character cannot be transferred twice.
+    a_pull = await user_collection.update_one(
+        {"id": a_id, "characters.id": a_char["id"]},
+        {"$pull": {"characters": {"id": a_char["id"]}}},
+    )
+    b_pull = await user_collection.update_one(
+        {"id": b_id, "characters.id": b_char["id"]},
+        {"$pull": {"characters": {"id": b_char["id"]}}},
+    )
+    if a_pull.modified_count != 1 or b_pull.modified_count != 1:
+        # Best-effort compensation if a concurrent action changed ownership.
+        if a_pull.modified_count == 1:
+            await user_collection.update_one({"id": a_id}, {"$push": {"characters": a_char}})
+        if b_pull.modified_count == 1:
+            await user_collection.update_one({"id": b_id}, {"$push": {"characters": b_char}})
+        await q.edit_message_text("❌ Trade cancelled because inventory changed. Please start a new trade.")
+        return
 
-    await user_collection.update_one({"id": a_id}, {"$pull": {"characters": {"id": a_char["id"]}}})
-    await user_collection.update_one({"id": b_id}, {"$pull": {"characters": {"id": b_char["id"]}}})
     await user_collection.update_one({"id": a_id}, {"$push": {"characters": b_char}})
     await user_collection.update_one({"id": b_id}, {"$push": {"characters": a_char}})
 

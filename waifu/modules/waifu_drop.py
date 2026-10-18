@@ -44,6 +44,7 @@ _warned:           dict[int, float] = {}   # user_id → timestamp of last warni
 # Rolling window of recently sent char IDs per chat — capped dynamically
 _sent_ids:         dict[int, list]  = {}
 _registered_chats: set[int]         = set()
+_drop_locks:       dict[int, asyncio.Lock] = {}  # Serialize drop creation per chat
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -67,7 +68,7 @@ def _rolling_window_size(total_chars: int) -> int:
     return max(20, total_chars // 2)
 
 
-async def _send_drop(chat_id: int, bot) -> None:
+async def _send_drop_unlocked(chat_id: int, bot) -> None:
     """Pick a random unseen-recently character and post it to the chat."""
     all_chars = await collection.find({}).to_list(length=5000)
     if not all_chars:
@@ -113,6 +114,13 @@ async def _send_drop(chat_id: int, bot) -> None:
         # Roll back state if we couldn't actually post the message
         _active_char.pop(chat_id, None)
         LOGGER.warning("Drop failed in chat %s: %s", chat_id, e)
+
+
+async def _send_drop(chat_id: int, bot) -> None:
+    """Prevent timer and message-threshold triggers from overlapping in one chat."""
+    lock = _drop_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        await _send_drop_unlocked(chat_id, bot)
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────

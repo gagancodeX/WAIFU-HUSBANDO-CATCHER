@@ -52,28 +52,38 @@ async def balance(update: Update, context: CallbackContext) -> None:
 # ── /daily ────────────────────────────────────────────────────────────────────
 
 async def daily(update: Update, context: CallbackContext) -> None:
-    u   = update.effective_user
-    doc = await _ensure_user(u.id, u)
+    u = update.effective_user
+    await _ensure_user(u.id, u)
     now = time.time()
-    last = doc.get("last_daily", 0)
+    reward = Config.DAILY_COINS
 
-    if now - last < _DAILY_COOLDOWN:
-        remaining = int(_DAILY_COOLDOWN - (now - last))
+    # One conditional database write arbitrates simultaneous claims. Treat a
+    # missing last_daily as eligible for legacy accounts.
+    result = await user_collection.update_one(
+        {
+            "id": u.id,
+            "$or": [
+                {"last_daily": {"$lte": now - _DAILY_COOLDOWN}},
+                {"last_daily": {"$exists": False}},
+            ],
+        },
+        {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
+    )
+    if result.modified_count != 1:
+        latest = await user_collection.find_one({"id": u.id}) or {}
+        last = float(latest.get("last_daily", now) or now)
+        remaining = max(1, int(_DAILY_COOLDOWN - (now - last)))
         await update.message.reply_text(
             f"⏳ Daily already claimed!\nCome back in <b>{_fmt_time(remaining)}</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    reward = Config.DAILY_COINS
-    await user_collection.update_one(
-        {"id": u.id},
-        {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
-    )
+    latest = await user_collection.find_one({"id": u.id}) or {}
     await update.message.reply_text(
         f"🎁 <b>Daily reward!</b>\n\n"
         f"You received <b>{reward:,} coins</b> 🪙\n"
-        f"Current balance: <b>{doc.get('coins', 0) + reward:,}</b>",
+        f"Current balance: <b>{latest.get('coins', 0):,}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -211,33 +221,60 @@ async def buy(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("❌ Invalid listing ID.")
         return
 
-    listing = await market_collection.find_one({"_id": oid})
+    buyer = await user_collection.find_one({"id": u.id})
+    if not buyer:
+        await update.message.reply_text("❌ Use /start first, then try again.")
+        return
+
+    # Claim the listing first. Only one concurrent buyer can remove this
+    # listing from the market; other buyers will get a clean failure.
+    listing = await market_collection.find_one_and_delete({"_id": oid})
     if not listing:
         await update.message.reply_text("❌ Listing not found or already sold.")
         return
     if listing["seller_id"] == u.id:
+        await market_collection.insert_one(listing)
         await update.message.reply_text("❌ You can't buy your own listing.")
         return
 
-    buyer = await user_collection.find_one({"id": u.id})
-    if not buyer or buyer.get("coins", 0) < listing["price"]:
+    price = int(listing["price"])
+    debit = await user_collection.update_one(
+        {"id": u.id, "coins": {"$gte": price}},
+        {"$inc": {"coins": -price}},
+    )
+    if debit.modified_count != 1:
+        # Restore the listing if the buyer could not pay.
+        listing.pop("_id", None)
+        await market_collection.insert_one(listing)
         await update.message.reply_text(
-            f"❌ Not enough coins. Need <b>{listing['price']:,}</b>.",
+            f"❌ Not enough coins. Need <b>{price:,}</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # Atomic exchange
-    await user_collection.update_one({"id": u.id},
-        {"$inc": {"coins": -listing["price"]},
-         "$push": {"characters": listing["char"]}})
-    await user_collection.update_one({"id": listing["seller_id"]},
-        {"$inc": {"coins": listing["price"]}})
-    await market_collection.delete_one({"_id": oid})
+    # Update buyer inventory and seller proceeds after the listing is claimed.
+    await user_collection.update_one(
+        {"id": u.id},
+        {"$push": {"characters": listing["char"]}},
+    )
+    seller_update = await user_collection.update_one(
+        {"id": listing["seller_id"]},
+        {"$inc": {"coins": price}},
+    )
+    if seller_update.matched_count != 1:
+        # Compensate for a stale listing whose seller no longer exists.
+        await user_collection.update_one(
+            {"id": u.id},
+            {"$inc": {"coins": price}, "$pull": {"characters": {"id": listing["char"]["id"]}}},
+        )
+        listing.pop("_id", None)
+        await market_collection.insert_one(listing)
+        await update.message.reply_text("❌ Seller account unavailable; purchase was cancelled.")
+        return
 
     char = listing["char"]
     await update.message.reply_text(
-        f"✅ You bought <b>{escape(char['name'])}</b> for <b>{listing['price']:,} 🪙</b>!",
+        f"✅ You bought <b>{escape(char['name'])}</b> for <b>{price:,} 🪙</b>!",
         parse_mode=ParseMode.HTML,
     )
 

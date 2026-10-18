@@ -52,35 +52,27 @@ async def balance(update: Update, context: CallbackContext) -> None:
 # ── /daily ────────────────────────────────────────────────────────────────────
 
 async def daily(update: Update, context: CallbackContext) -> None:
-    u   = update.effective_user
-    doc = await _ensure_user(u.id, u)
+    u = update.effective_user
+    await _ensure_user(u.id, u)
     now = time.time()
-    last = float(doc.get("last_daily", 0) or 0)
-
-    if now - last < _DAILY_COOLDOWN:
-        remaining = int(_DAILY_COOLDOWN - (now - last))
-        await update.message.reply_text(
-            f"⏳ Daily already claimed!\nCome back in <b>{_fmt_time(remaining)}</b>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    # Conditional update makes the cooldown check and claim one atomic DB
-    # operation; concurrent /daily calls cannot both win the same cooldown.
     reward = Config.DAILY_COINS
+
+    # One conditional database write arbitrates simultaneous claims. Treat a
+    # missing last_daily as eligible for legacy accounts.
     result = await user_collection.update_one(
-        {"id": u.id, "last_daily": {"$lt": now - _DAILY_COOLDOWN}},
+        {
+            "id": u.id,
+            "$or": [
+                {"last_daily": {"$lte": now - _DAILY_COOLDOWN}},
+                {"last_daily": {"$exists": False}},
+            ],
+        },
         {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
     )
     if result.modified_count != 1:
-        # Missing last_daily is handled separately for legacy/new documents.
-        result = await user_collection.update_one(
-            {"id": u.id, "last_daily": {"$exists": False}},
-            {"$inc": {"coins": reward}, "$set": {"last_daily": now}},
-        )
-    if result.modified_count != 1:
         latest = await user_collection.find_one({"id": u.id}) or {}
-        remaining = max(1, int(_DAILY_COOLDOWN - (now - float(latest.get("last_daily", now)))))
+        last = float(latest.get("last_daily", now) or now)
+        remaining = max(1, int(_DAILY_COOLDOWN - (now - last)))
         await update.message.reply_text(
             f"⏳ Daily already claimed!\nCome back in <b>{_fmt_time(remaining)}</b>.",
             parse_mode=ParseMode.HTML,
